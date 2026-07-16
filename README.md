@@ -1,0 +1,143 @@
+# krepis-conformance
+
+The Krepis kernel-family conformance suite (KRA-752 §10). Each kernel runs this
+suite in its own CI; the family standard is pinned mechanically so the six
+kernels — zygos · Obolos · Apotheke · chreos · Misthos · Taxis — cannot
+re-drift on the seams a unified product surface touches.
+
+**Kernel-family-owned.** Zero sokrates-workspace dependencies, zero framework
+dependencies: the package depends only on `pytest`, `httpx`, and `pyyaml`.
+`fastapi`, `fastapi_mcp`, `morphe_surface`, and `starlette` are imported lazily
+from the consuming kernel's own environment, so this package can never drag a
+version pin into a kernel.
+
+## What the suite asserts (KRA-752 standard §1–§9)
+
+| § | Check | Mechanism |
+|---|-------|-----------|
+| 1 | `auth_mode ∈ {disabled, bearer}`, default `disabled` | settings-class field introspection |
+| 2 | env prefix == kernel name (`ZYGOS_`, never `BD_`) | settings `model_config` |
+| 3 | `fastapi_mcp` mounted at `/mcp` in the shared `_PrunedFastApiMCP` shape (subclass overriding `setup_server`); handle on `app.state.mcp` | live app inspection |
+| 4 | exactly one Morphe dep, pinned to the family tag (`py-v0.5.0`, no raw commits); `EXPECTED_GRAMMAR_VERSION is GRAMMAR_VERSION` (identity — dynamic-from-package, never a literal) | pyproject regex + module import |
+| 5 | every parameterized route roots at `/orgs/{org_id}`; static discovery paths are free | live OpenAPI paths |
+| 6 | the `EventStore` protocol declares `initialize_schema()` **and** `close()` | protocol introspection |
+| 7 | auth failures are structured problems: 401 + `code: ERR-UNAUTHORIZED` + `WWW-Authenticate: Bearer`, and the configured token is actually accepted | behavioural, in-memory app + TestClient |
+| 8 | `deploy/coolify.yml` pins an immutable digest (literal `@sha256` or required `${VAR:?…digest…}`), never `:latest`; `compose.yml` declares a healthcheck; the kernel binds its registry port and nobody else's | YAML parsing |
+| 9 | `integrations/sokrates` bundle completeness: `*source.yaml` + `specs/*.openapi.json` + `recipes/` + `compose.*.yml` + `README.md` (the Taxis template) | tree checks |
+
+Port registry (§8): zygos 8200 · Obolos 8201 · Apotheke 8202 · chreos 8203 ·
+Misthos 8204 · Taxis 8205. Adding a kernel or moving a port is a family
+decision made in `krepis_conformance/registry.py` — as is bumping the family
+Morphe tag (`FAMILY_MORPHE_TAG`): one edit here plus a conformance release
+turns every kernel's CI red until it follows.
+
+## Adopting in a kernel
+
+1. Add the dev dependency (uv git dependency, pinned to a tag once released):
+
+   ```toml
+   [dependency-groups]
+   dev = [
+       "krepis-conformance @ git+https://github.com/RationallyPrime/krepis-conformance.git@v0.1.0",
+   ]
+   ```
+
+2. Declare the profile in `tests/conftest.py`:
+
+   ```python
+   import pytest
+   from pathlib import Path
+   from krepis_conformance import KernelProfile
+
+   from taxis.api.app import create_app
+   from taxis.settings import Settings
+   from taxis.storage.repository import EventStore
+
+
+   @pytest.fixture
+   def kernel_profile() -> KernelProfile:
+       def build_app(auth_mode: str, api_token: str | None) -> object:
+           settings = Settings(
+               environment="test",
+               storage_backend="memory",
+               auth_mode=auth_mode,
+               api_token=api_token,
+           )
+           return create_app(settings)
+
+       return KernelProfile(
+           kernel_name="taxis",
+           repo_root=Path(__file__).resolve().parents[1],
+           settings_cls=Settings,
+           build_app=build_app,
+           store_protocol=EventStore,
+           surfaces_module="taxis.surfaces",
+       )
+   ```
+
+3. Add `tests/test_conformance.py`:
+
+   ```python
+   from krepis_conformance.suite import *  # noqa: F401,F403
+   ```
+
+That's it — `just test` (and therefore `just check` / CI) now runs the family
+suite alongside the kernel's own tests.
+
+### Profile contract
+
+| Field | Meaning |
+|---|---|
+| `kernel_name` | lowercase family name; must exist in the port registry |
+| `repo_root` | the kernel repo checkout root (tree checks run against it) |
+| `settings_cls` | the pydantic-settings class (§1/§2 introspection) |
+| `build_app` | `(auth_mode, api_token) -> app` — fresh, **memory-backed**, MCP handle on `app.state.mcp` |
+| `store_protocol` | the `EventStore` `Protocol` class (§6) |
+| `surfaces_module` | dotted module exporting `EXPECTED_GRAMMAR_VERSION` (§4) |
+| `protected_probe_path` | a real authenticated GET route (default `/orgs`) for the §7 behavioural probe |
+| `deviations` | declared, reasoned departures — see below |
+
+### Deviations — the only escape hatch
+
+A kernel that genuinely cannot satisfy an item declares it **with a reason**;
+the suite then skips that item loudly (the reason shows in pytest output).
+An unreasoned deviation is rejected at profile construction; silently skipping
+a check is impossible by design. The one sanctioned case today is zygos
+book-scope (a book is not an org):
+
+```python
+from krepis_conformance import Deviation, KernelProfile
+from krepis_conformance.profile import ConformanceItem
+
+KernelProfile(
+    kernel_name="zygos",
+    ...,
+    deviations=(
+        Deviation(
+            item=ConformanceItem.ORG_SCOPE,
+            reason="a book is not an org; the kernel feed is book-scoped and the "
+            "served contract documents the deviation (KRA-752 §5)",
+        ),
+    ),
+)
+```
+
+## Vendoring fallback
+
+The shared-package mechanism is open to founder veto (KRA-752 §10). The suite
+is deliberately vendorable wholesale: copy `registry.py`, `profile.py`,
+`checks.py`, and `suite.py` into a kernel's `tests/conformance/` and the star
+import keeps working — the modules have no dependencies beyond `pytest`,
+`httpx`, and `pyyaml`, and all framework imports resolve from the kernel
+itself.
+
+## Developing this package
+
+```bash
+uv sync
+just check   # lock-check + fmt-check + lint + ty + tests
+```
+
+The package's own tests dogfood the suite against a fake, fully conforming
+kernel (`tests/conftest.py`) and mutation-test every check against the exact
+drift it exists to catch (`tests/test_checks.py`).
