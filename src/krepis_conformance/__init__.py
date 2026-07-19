@@ -19,6 +19,7 @@ from krepis_conformance.registry import (
     FAMILY_AUTH_MODES,
     FAMILY_MORPHE_TAG,
     FAMILY_PORTS,
+    GOVERNED_READ_PARAM,
     ORG_SCOPE_PREFIX,
     UNAUTHORIZED_CODE,
 )
@@ -29,6 +30,7 @@ __all__ = [
     "FAMILY_AUTH_MODES",
     "FAMILY_MORPHE_TAG",
     "FAMILY_PORTS",
+    "GOVERNED_READ_PARAM",
     "ORG_SCOPE_PREFIX",
     "UNAUTHORIZED_CODE",
     "AppBuilder",

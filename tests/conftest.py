@@ -173,8 +173,10 @@ def build_fake_app(auth_mode: str, api_token: str | None) -> FastAPI:
         return []
 
     @app.get("/orgs/{org_id}", operation_id="get_org", dependencies=protected)
-    def get_org(org_id: str) -> dict[str, str]:
-        return {"org_id": org_id}
+    def get_org(org_id: str, include_pii: bool = False) -> dict[str, str]:
+        # The governed drill-in: the ONE sanctioned spelling of a privileged
+        # read selector (§11) — the selfcheck proves it passes as-is.
+        return {"org_id": org_id, "include_pii": str(include_pii)}
 
     @app.get("/orgs/{org_id}/events", operation_id="list_events", dependencies=protected)
     def list_events(org_id: str) -> dict[str, str]:

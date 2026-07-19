@@ -346,6 +346,78 @@ def test_conforming_tree_passes_every_tree_check(
     checks.check_sokrates_bundle(kernel_profile)
 
 
+# ── §11 governed-read selector convention ──────────────────────────────
+
+
+def _openapi_stub(paths: dict[str, Any]) -> object:
+    class _Stub:
+        def openapi(self) -> dict[str, Any]:
+            return {"paths": paths}
+
+    return _Stub()
+
+
+def test_conforming_governed_selector_passes(kernel_profile: KernelProfile) -> None:
+    # The fake kernel drills in with the ONE sanctioned spelling.
+    checks.check_governed_read_params(kernel_profile, build_fake_app("disabled", None))
+
+
+def test_misspelled_pii_selector_fails(kernel_profile: KernelProfile) -> None:
+    app = FastAPI(title="Drifted", version="0.0.0")
+
+    @app.get("/orgs/{org_id}/parties")
+    def parties(org_id: str, show_pii: bool = False) -> dict[str, str]:
+        return {"org_id": org_id}
+
+    with pytest.raises(ConformanceError, match="show_pii"):
+        checks.check_governed_read_params(kernel_profile, app)
+
+
+def test_novel_privileged_selector_fails(kernel_profile: KernelProfile) -> None:
+    # A privileged selector under a fresh name (never configured viewer-side)
+    # is exactly the silent opt-out §11 exists to forbid.
+    app = FastAPI(title="Drifted", version="0.0.0")
+
+    @app.get("/orgs/{org_id}/ledger")
+    def ledger(org_id: str, unmask: bool = False) -> dict[str, str]:
+        return {"org_id": org_id}
+
+    with pytest.raises(ConformanceError, match="unmask"):
+        checks.check_governed_read_params(kernel_profile, app)
+
+
+def test_path_level_governed_param_drift_fails(kernel_profile: KernelProfile) -> None:
+    # Parameters merged at the path-item level are scanned too.
+    stub = _openapi_stub(
+        {
+            "/orgs/{org_id}": {
+                "parameters": [{"in": "query", "name": "reveal_plaintext"}],
+                "get": {"parameters": []},
+            }
+        }
+    )
+    with pytest.raises(ConformanceError, match="reveal_plaintext"):
+        checks.check_governed_read_params(kernel_profile, stub)
+
+
+def test_non_query_and_benign_params_pass(kernel_profile: KernelProfile) -> None:
+    stub = _openapi_stub(
+        {
+            "/orgs/{org_id}": {
+                "get": {
+                    "parameters": [
+                        {"in": "path", "name": "org_id"},
+                        {"in": "query", "name": "include_pii"},
+                        {"in": "query", "name": "window_start"},
+                        {"in": "header", "name": "x-pii-audit"},
+                    ]
+                }
+            }
+        }
+    )
+    checks.check_governed_read_params(kernel_profile, stub)
+
+
 # ── deviations skip loudly through the suite ───────────────────────────
 
 

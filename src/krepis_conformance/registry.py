@@ -8,6 +8,7 @@ any kernel or on the sokrates workspace.
 
 from __future__ import annotations
 
+import re
 from types import MappingProxyType
 
 FAMILY_MORPHE_TAG = "py-v0.5.0"
@@ -43,6 +44,26 @@ FAMILY_PORTS: MappingProxyType[str, int] = MappingProxyType(
 )
 """The unique family port registry (KRA-752 §8). Adding a kernel is a family decision here."""
 
+GOVERNED_READ_PARAM = "include_pii"
+"""The single family spelling of a governed-read query selector (§11, KRA-780).
+
+A governed-read selector flips a surface into a privileged representation on
+the caller's authority. The public Morphe viewer refuses to forward governed
+params at its one forwarding choke point, fail-closed to ``["include_pii"]``
+when a source declares nothing (morphe #59) — so the edge guard holds ONLY
+while every kernel spells its privileged selector exactly this way. Extending
+the family's governed vocabulary is a family decision made here.
+"""
+
+GOVERNED_READ_NAME_RE = re.compile(r"pii|unmask|reveal|plaintext|decrypt|sensitive", re.IGNORECASE)
+"""What a privileged-read-shaped query param name looks like (§11).
+
+The mechanical half of the convention: any query parameter whose name matches
+this pattern is treated as a governed-read selector and must be spelled
+exactly :data:`GOVERNED_READ_PARAM`. A kernel that genuinely needs a second
+governed selector adds it to the registry — never ships its own spelling.
+"""
+
 UNSCOPED_PATH_ALLOWLIST = frozenset(
     {
         "/healthz",
@@ -60,6 +81,8 @@ __all__ = [
     "FAMILY_AUTH_MODES",
     "FAMILY_MORPHE_TAG",
     "FAMILY_PORTS",
+    "GOVERNED_READ_NAME_RE",
+    "GOVERNED_READ_PARAM",
     "MORPHE_REPO_PATTERN",
     "ORG_SCOPE_PREFIX",
     "UNAUTHORIZED_CODE",

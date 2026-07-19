@@ -11,7 +11,7 @@ dependencies: the package depends only on `pytest`, `httpx`, and `pyyaml`.
 from the consuming kernel's own environment, so this package can never drag a
 version pin into a kernel.
 
-## What the suite asserts (KRA-752 standard §1–§9)
+## What the suite asserts (KRA-752 standard §1–§9, + §11)
 
 | § | Check | Mechanism |
 |---|-------|-----------|
@@ -24,6 +24,7 @@ version pin into a kernel.
 | 7 | auth failures are structured problems: 401 + `code: ERR-UNAUTHORIZED` + `WWW-Authenticate: Bearer`, and the configured token is actually accepted | behavioural, in-memory app + TestClient |
 | 8 | `deploy/coolify.yml` pins an immutable digest (literal `@sha256` or required `${VAR:?…digest…}`), never `:latest`; `compose.yml` declares a healthcheck; the kernel binds its registry port and nobody else's | YAML parsing |
 | 9 | `integrations/sokrates` bundle completeness: `*source.yaml` + `specs/*.openapi.json` + `recipes/` + `compose.*.yml` + `README.md` (the Taxis template) | tree checks |
+| 11 | governed-read selector convention (KRA-780): any privileged-read-shaped query param (pii/unmask/reveal/plaintext/decrypt/sensitive) is spelled exactly `include_pii` — the one name the public Morphe viewer strips fail-closed at its forwarding choke point (morphe #59), so a future source cannot silently opt out of the edge guard | live OpenAPI query-param scan |
 
 Port registry (§8): zygos 8200 · Obolos 8201 · Apotheke 8202 · chreos 8203 ·
 Misthos 8204 · Taxis 8205. Adding a kernel or moving a port is a family

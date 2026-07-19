@@ -27,6 +27,8 @@ from krepis_conformance.registry import (
     FAMILY_AUTH_MODES,
     FAMILY_MORPHE_TAG,
     FAMILY_PORTS,
+    GOVERNED_READ_NAME_RE,
+    GOVERNED_READ_PARAM,
     MORPHE_REPO_PATTERN,
     ORG_SCOPE_PREFIX,
     UNAUTHORIZED_CODE,
@@ -395,6 +397,52 @@ def check_sokrates_bundle(profile: KernelProfile) -> None:
         )
 
 
+# ── §11 governed-read selector convention ──────────────────────────────
+
+
+def check_governed_read_params(profile: KernelProfile, app: object) -> None:
+    """§11: a privileged-read query selector is spelled exactly ``include_pii``.
+
+    The public Morphe viewer never forwards governed-read params: it strips
+    them at its single forwarding choke point, fail-closed to the family
+    default ``["include_pii"]`` when a source declares nothing (morphe #59 —
+    the fix for the live PII leak KRA-780 closed). That edge guard holds ONLY
+    while every kernel spells its privileged selector exactly
+    :data:`GOVERNED_READ_PARAM`: a pii-shaped query param under any other
+    name rides the forward untouched and silently re-opens the leak for that
+    source. Scanned over the live OpenAPI — surfaces and drill-ins alike — so
+    the drift turns the kernel's own CI red before the viewer ever sees it.
+    """
+    openapi = getattr(app, "openapi", None)
+    if not callable(openapi):
+        _fail(f"{profile.kernel_name} app does not expose .openapi()")
+    schema = cast("dict[str, Any]", openapi())
+    offenders: list[str] = []
+    for path, item in schema.get("paths", {}).items():
+        if not isinstance(item, dict):
+            continue
+        operations = [item, *(value for value in item.values() if isinstance(value, dict))]
+        for operation in operations:
+            parameters = operation.get("parameters")
+            if not isinstance(parameters, list):
+                continue
+            for parameter in parameters:
+                if not isinstance(parameter, dict) or parameter.get("in") != "query":
+                    continue
+                name = str(parameter.get("name", ""))
+                if GOVERNED_READ_NAME_RE.search(name) and name != GOVERNED_READ_PARAM:
+                    offenders.append(f"{path}?{name}")
+    if offenders:
+        _fail(
+            f"a governed-read query selector must be spelled exactly "
+            f"{GOVERNED_READ_PARAM!r} — the public viewer strips only that name "
+            f"(fail-closed default), so any other spelling forwards through the "
+            f"edge and leaks the privileged representation; {profile.kernel_name} "
+            f"serves {sorted(set(offenders))!r} (extending the governed vocabulary "
+            "is a family decision in krepis_conformance.registry)"
+        )
+
+
 __all__ = [
     "ConformanceError",
     "check_auth_errors",
@@ -404,6 +452,7 @@ __all__ = [
     "check_deploy_digest_pin",
     "check_env_prefix",
     "check_family_port",
+    "check_governed_read_params",
     "check_mcp_surface",
     "check_morphe_boot_assertion",
     "check_morphe_pin",

@@ -42,6 +42,7 @@ class ConformanceItem(StrEnum):
     DEPLOY = "deploy"  # §8 digest-pinned image + healthcheck
     PORT = "port"  # §8 unique family port registry
     BUNDLE = "bundle"  # §9 integrations/sokrates completeness
+    GOVERNED_PARAMS = "governed-params"  # §11 governed-read selector spelled include_pii
 
 
 @dataclass(frozen=True, slots=True)

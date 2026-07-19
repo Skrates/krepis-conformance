@@ -66,6 +66,7 @@ __all__ = [
     "test_env_prefix_is_kernel_name",
     "test_event_store_protocol_declares_lifecycle",
     "test_family_port_is_registered_and_bound",
+    "test_governed_read_selector_is_the_family_param",
     "test_mcp_mounts_the_shared_pruned_shape",
     "test_morphe_boot_assertion_is_dynamic",
     "test_morphe_pin_is_the_family_tag",
@@ -188,3 +189,13 @@ def test_family_port_is_registered_and_bound(kernel_profile: KernelProfile) -> N
 def test_sokrates_bundle_is_complete(kernel_profile: KernelProfile) -> None:
     _respect_deviation(kernel_profile, ConformanceItem.BUNDLE)
     checks.check_sokrates_bundle(kernel_profile)
+
+
+# ── §11 governed-read selector convention ──────────────────────────────
+
+
+def test_governed_read_selector_is_the_family_param(
+    kernel_profile: KernelProfile, conformance_app: object
+) -> None:
+    _respect_deviation(kernel_profile, ConformanceItem.GOVERNED_PARAMS)
+    checks.check_governed_read_params(kernel_profile, conformance_app)
