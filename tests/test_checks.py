@@ -141,7 +141,7 @@ def test_raw_commit_pin_fails(kernel_profile: KernelProfile, tmp_path: Path) -> 
         },
     )
     profile = _profile(kernel_profile, repo_root=root)
-    with pytest.raises(ConformanceError, match=r"py-v0\.5\.0"):
+    with pytest.raises(ConformanceError, match=r"py-v0\.7\.0"):
         checks.check_morphe_pin(profile)
 
 
@@ -153,7 +153,7 @@ def test_missing_morphe_dependency_fails(kernel_profile: KernelProfile, tmp_path
 
 
 def test_double_morphe_dependency_fails(kernel_profile: KernelProfile, tmp_path: Path) -> None:
-    line = '    "morphe-grammar @ git+https://github.com/RationallyPrime/morphe.git@py-v0.5.0",\n'
+    line = '    "morphe-grammar @ git+https://github.com/RationallyPrime/morphe.git@py-v0.7.0",\n'
     root = _mutated_tree(
         tmp_path, {"pyproject.toml": f"[project]\ndependencies = [\n{line}{line}]\n"}
     )

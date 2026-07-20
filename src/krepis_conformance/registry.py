@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from types import MappingProxyType
 
-FAMILY_MORPHE_TAG = "py-v0.5.0"
+FAMILY_MORPHE_TAG = "py-v0.7.0"
 """The single family-wide Morphe compiler pin (KRA-752 §4) — an immutable py-v tag."""
 
 MORPHE_REPO_PATTERN = r"git\+https://github\.com/RationallyPrime/morphe(?:\.git)?"

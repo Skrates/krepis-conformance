@@ -18,7 +18,7 @@ version pin into a kernel.
 | 1 | `auth_mode ∈ {disabled, bearer}`, default `disabled` | settings-class field introspection |
 | 2 | env prefix == kernel name (`ZYGOS_`, never `BD_`) | settings `model_config` |
 | 3 | `fastapi_mcp` mounted at `/mcp` in the shared `_PrunedFastApiMCP` shape (subclass overriding `setup_server`); handle on `app.state.mcp` | live app inspection |
-| 4 | exactly one Morphe dep, pinned to the family tag (`py-v0.5.0`, no raw commits); `EXPECTED_GRAMMAR_VERSION is GRAMMAR_VERSION` (identity — dynamic-from-package, never a literal) | pyproject regex + module import |
+| 4 | exactly one Morphe dep, pinned to the family tag (`py-v0.7.0`, no raw commits); `EXPECTED_GRAMMAR_VERSION is GRAMMAR_VERSION` (identity — dynamic-from-package, never a literal) | pyproject regex + module import |
 | 5 | every parameterized route roots at `/orgs/{org_id}`; static discovery paths are free | live OpenAPI paths |
 | 6 | the `EventStore` protocol declares `initialize_schema()` **and** `close()` | protocol introspection |
 | 7 | auth failures are structured problems: 401 + `code: ERR-UNAUTHORIZED` + `WWW-Authenticate: Bearer`, and the configured token is actually accepted | behavioural, in-memory app + TestClient |
