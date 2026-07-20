@@ -206,7 +206,7 @@ def write_fake_repo_tree(root: Path, *, kernel: str = FAKE_KERNEL_NAME, port: in
         f'name = "{kernel}"\n'
         "dependencies = [\n"
         '    "fastapi>=0.115.0",\n'
-        '    "morphe-grammar @ git+https://github.com/RationallyPrime/morphe.git@py-v0.5.0",\n'
+        '    "morphe-grammar @ git+https://github.com/RationallyPrime/morphe.git@py-v0.7.0",\n'
         "]\n",
         encoding="utf-8",
     )
