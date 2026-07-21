@@ -64,6 +64,25 @@ exactly :data:`GOVERNED_READ_PARAM`. A kernel that genuinely needs a second
 governed selector adds it to the registry — never ships its own spelling.
 """
 
+SURFACE_OPERATION_TAG = "surfaces"
+"""The OpenAPI tag that makes a GET operation part of the Morphe surface set."""
+
+TEMPORAL_QUERY_PARAM = "as_of"
+"""The one family spelling for the effective-date selector (KRA-779)."""
+
+RETIRED_TEMPORAL_QUERY_PARAMS = frozenset(
+    {"week", "period", "effective_at", "window_start", "window_end", "from", "to"}
+)
+"""Retired effective-time selector spellings that may not survive on a surface GET.
+
+Sequence/cursor axes (``at_sequence``, ``as_of_sequence``, and
+``after_sequence``) are intentionally absent: they remain independent of the
+effective-date ``as_of`` axis.
+"""
+
+SOURCE_SURFACE_MEDIA_TYPE = "application/vnd.morphe.source-surface+json;v=1"
+"""The signed source-v1 representation every behavioral temporal probe requests."""
+
 UNSCOPED_PATH_ALLOWLIST = frozenset(
     {
         "/healthz",
@@ -85,6 +104,10 @@ __all__ = [
     "GOVERNED_READ_PARAM",
     "MORPHE_REPO_PATTERN",
     "ORG_SCOPE_PREFIX",
+    "RETIRED_TEMPORAL_QUERY_PARAMS",
+    "SOURCE_SURFACE_MEDIA_TYPE",
+    "SURFACE_OPERATION_TAG",
+    "TEMPORAL_QUERY_PARAM",
     "UNAUTHORIZED_CODE",
     "UNSCOPED_PATH_ALLOWLIST",
 ]

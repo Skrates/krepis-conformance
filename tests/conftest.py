@@ -13,13 +13,13 @@ import json
 import sys
 import types
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 
 import fastapi_mcp.server as fastapi_mcp_server
 import pytest
-from fastapi import Depends, FastAPI, Request
+from fastapi import Depends, FastAPI, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi_mcp import FastApiMCP
 from fastapi_mcp.types import AuthConfig
@@ -29,6 +29,10 @@ from krepis_conformance import KernelProfile, TemporalProbe, TemporalProofMode
 
 FAKE_KERNEL_NAME = "taxis"  # borrowed registry identity; port 8205
 FAKE_SURFACES_MODULE = "krepis_fake_kernel_surfaces"
+FAKE_SOURCE_MEDIA_TYPE = "application/vnd.morphe.source-surface+json;v=1"
+FAKE_ORG_ID = "org-temporal"
+FAKE_RECORD_ID = "record-later"
+FAKE_LATER_SENTINEL = "LATER-EFFECTIVE-SENTINEL"
 
 # Runtime-constructed so no compile-time literal elsewhere can alias it: the §4
 # check asserts identity, and the mutation tests need an equal-but-distinct str.
@@ -42,6 +46,13 @@ FAKE_GRAMMAR_VERSION = "".join(["99", ".0-conformance-test"])
 def fake_morphe_modules() -> Any:
     morphe_stub = types.ModuleType("morphe_surface")
     cast("Any", morphe_stub).GRAMMAR_VERSION = FAKE_GRAMMAR_VERSION
+    cast("Any", morphe_stub).canonical_json_bytes = lambda value: json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
     surfaces_stub = types.ModuleType(FAKE_SURFACES_MODULE)
     cast("Any", surfaces_stub).EXPECTED_GRAMMAR_VERSION = FAKE_GRAMMAR_VERSION
     sys.modules["morphe_surface"] = morphe_stub
@@ -74,6 +85,37 @@ class FakeUnauthorized(Exception):
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class FakeRuntimeSigner:
+    """A runtime-only signer whose varying envelope proves comparisons ignore wire noise."""
+
+    def __init__(self) -> None:
+        self._nonce = 0
+
+    def author(self, data: Any, *, surface_id: str) -> dict[str, Any]:
+        self._nonce += 1
+        canonical = json.dumps(
+            data,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        signature = hmac.digest(b"runtime-conformance-signer", canonical, "sha256").hex()
+        return {
+            "kind": "morphe.source-surface",
+            "issuer": FAKE_KERNEL_NAME,
+            "surface_id": surface_id,
+            "source_revision": f"runtime-{self._nonce}",
+            "produced_at": datetime.now(UTC).isoformat(),
+            "data": data,
+            "attestation": {
+                "algorithm": "test-hmac-sha256",
+                "key_id": "runtime-conformance-key",
+                "signature": signature,
+            },
+        }
 
 
 # ── the shared _PrunedFastApiMCP shape (Taxis template, verbatim shape) ─
@@ -146,6 +188,8 @@ def build_fake_app(auth_mode: str, api_token: str | None) -> FastAPI:
             raise FakeUnauthorized("A valid bearer credential is required.")
 
     app = FastAPI(title="Fake Krepis Kernel", version="0.0.0")
+    app.state.temporal_records = []
+    app.state.source_signer = None
 
     @app.exception_handler(FakeUnauthorized)
     async def unauthorized_handler(request: Request, exc: FakeUnauthorized) -> JSONResponse:
@@ -183,9 +227,95 @@ def build_fake_app(auth_mode: str, api_token: str | None) -> FastAPI:
     def list_events(org_id: str) -> dict[str, str]:
         return {"org_id": org_id}
 
-    @app.get("/surfaces/orgs", operation_id="surface_orgs", dependencies=protected)
-    def surface_orgs() -> list[dict[str, str]]:
-        return []
+    @app.post(
+        "/orgs/{org_id}/appends",
+        operation_id="append_temporal_records",
+        dependencies=protected,
+        status_code=201,
+    )
+    def append_temporal_records(org_id: str, payload: dict[str, Any]) -> JSONResponse:
+        events = payload.get("events")
+        if not isinstance(events, list) or not events:
+            return JSONResponse(status_code=422, content={"code": "ERR-VALIDATION"})
+        for event in events:
+            if isinstance(event, dict):
+                app.state.temporal_records.append({"org_id": org_id, **event})
+        return JSONResponse(status_code=201, content={"appended": len(events)})
+
+    def signed_surface(data: Any, *, surface_id: str) -> JSONResponse:
+        signer = app.state.source_signer
+        if signer is None:
+            return JSONResponse(status_code=503, content={"code": "ERR-SOURCE-UNAVAILABLE"})
+        return JSONResponse(
+            content=signer.author(data, surface_id=surface_id),
+            media_type=FAKE_SOURCE_MEDIA_TYPE,
+        )
+
+    @app.get(
+        "/surfaces/orgs",
+        operation_id="surface_orgs",
+        dependencies=protected,
+        tags=["surfaces"],
+    )
+    def surface_orgs(
+        as_of: Annotated[date | None, Query(description="Effective-date selection.")] = None,
+    ) -> JSONResponse:
+        selection = "all" if as_of is None else as_of.isoformat()
+        orgs = sorted({record["org_id"] for record in app.state.temporal_records})
+        return signed_surface({"orgs": orgs}, surface_id=f"taxis.orgs:as-of={selection}")
+
+    @app.get(
+        "/orgs/{org_id}/surfaces/events",
+        operation_id="surface_events",
+        dependencies=protected,
+        tags=["surfaces"],
+    )
+    def surface_events(
+        org_id: str,
+        as_of: Annotated[date | None, Query(description="Effective-date selection.")] = None,
+        after_sequence: Annotated[int, Query(ge=0)] = 0,
+    ) -> JSONResponse:
+        selection = "all" if as_of is None else as_of.isoformat()
+        rows = [
+            {"name": record["name"], "effective_date": record["effective_date"]}
+            for sequence, record in enumerate(app.state.temporal_records, start=1)
+            if record["org_id"] == org_id
+            and sequence > after_sequence
+            and (as_of is None or date.fromisoformat(record["effective_date"]) <= as_of)
+        ]
+        return signed_surface(
+            {"events": rows},
+            surface_id=f"taxis.events:{org_id}:as-of={selection}",
+        )
+
+    @app.get(
+        "/orgs/{org_id}/surfaces/records/{record_id}",
+        operation_id="surface_record",
+        dependencies=protected,
+        tags=["surfaces"],
+    )
+    def surface_record(
+        org_id: str,
+        record_id: str,
+        as_of: Annotated[date | None, Query(description="Effective-date selection.")] = None,
+    ) -> JSONResponse:
+        selection = "all" if as_of is None else as_of.isoformat()
+        record = next(
+            (
+                item
+                for item in app.state.temporal_records
+                if item["org_id"] == org_id and item["record_id"] == record_id
+            ),
+            None,
+        )
+        if record is None or (
+            as_of is not None and date.fromisoformat(record["effective_date"]) > as_of
+        ):
+            return JSONResponse(status_code=404, content={"code": "ERR-NOT-FOUND"})
+        return signed_surface(
+            {"record": {"name": record["name"]}},
+            surface_id=f"taxis.record:{record_id}:as-of={selection}",
+        )
 
     mcp = _PrunedFastApiMCP(
         app,
@@ -198,8 +328,27 @@ def build_fake_app(auth_mode: str, api_token: str | None) -> FastAPI:
 
 
 def prepare_fake_temporal_app(app: object, client: object) -> dict[str, str]:
-    """Return deterministic identifiers; behavioral seeding is added with the temporal check."""
-    return {"org_id": "org-temporal", "record_id": "record-later"}
+    """Install a runtime signer and seed effective-dated records through the append API."""
+    cast("Any", app).state.source_signer = FakeRuntimeSigner()
+    response = cast("Any", client).post(
+        f"/orgs/{FAKE_ORG_ID}/appends",
+        json={
+            "events": [
+                {
+                    "record_id": "record-earlier",
+                    "name": "EARLIER-EFFECTIVE-SENTINEL",
+                    "effective_date": "2026-01-01",
+                },
+                {
+                    "record_id": FAKE_RECORD_ID,
+                    "name": FAKE_LATER_SENTINEL,
+                    "effective_date": "2026-02-01",
+                },
+            ]
+        },
+    )
+    assert response.status_code == 201, response.text
+    return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
 
 
 # ── the fake repo tree (Taxis template shape) ──────────────────────────
@@ -286,7 +435,7 @@ def kernel_profile(fake_kernel: FakeKernel) -> KernelProfile:
                 earlier_as_of=date(2026, 1, 15),
                 later_as_of=date(2026, 2, 15),
                 proof_mode=TemporalProofMode.DATA_DELTA,
-                later_sentinel="LATER-EFFECTIVE-SENTINEL",
+                later_sentinel=FAKE_LATER_SENTINEL,
                 query_params=(("after_sequence", "0"),),
             ),
             TemporalProbe(

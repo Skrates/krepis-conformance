@@ -5,12 +5,11 @@ Each kernel declares exactly one :class:`KernelProfile` in its own test
 kernel-specific input the suite consumes — everything else is the family
 standard in :mod:`krepis_conformance.registry`.
 
-Deviations are the sole escape hatch: a kernel that genuinely cannot satisfy a
-standard item (the sanctioned case: zygos book-scope, where a book is not an
-org) declares the item WITH a reason. The suite then skips that item loudly —
-the reason shows in the pytest output — instead of failing. A deviation
-without a reason is rejected at profile construction; silently skipping a
-check is impossible by design.
+Deviations are the escape hatch for the original KRA-752 items: a kernel that
+genuinely cannot satisfy one (the sanctioned case: zygos book-scope, where a
+book is not an org) declares it WITH a reason. The temporal KRA-779 section is
+different by design: it has no :class:`ConformanceItem`, so it cannot be
+deviated. Every ``surfaces`` GET must have a behavioral probe.
 """
 
 from __future__ import annotations
@@ -140,6 +139,12 @@ class KernelProfile:
     ``build_app("bearer", token)`` for the behavioural auth checks. The app is
     expected to expose its MCP handle as ``app.state.mcp`` (the family
     ``create_app`` convention).
+
+    ``prepare_temporal_app`` runs inside a live ``TestClient`` context for a
+    second fresh app. It installs a runtime test signer when the app builder
+    does not, seeds through append endpoints, and returns only concrete values
+    for path placeholders. It never chooses or snaps dates: each immutable
+    ``TemporalProbe`` carries that contract directly.
     """
 
     kernel_name: str

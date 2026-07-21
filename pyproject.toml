@@ -1,7 +1,7 @@
 [project]
 name = "krepis-conformance"
-version = "0.1.0"
-description = "Krepis kernel-family conformance suite (KRA-752 §10): pytest checks that pin the family standard so the six kernels cannot re-drift."
+version = "0.4.0"
+description = "Krepis kernel-family conformance suite: pytest checks that pin shared API, deployment, and temporal contracts so the six kernels cannot re-drift."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 authors = [{ name = "Hákon Freyr Gunnarsson" }]
