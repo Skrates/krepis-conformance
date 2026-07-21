@@ -628,8 +628,39 @@ def test_signer_without_seed_data_fails(kernel_profile: KernelProfile) -> None:
         return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
 
     profile = _profile(kernel_profile, prepare_temporal_app=signer_only)
-    with pytest.raises(ConformanceError, match=r"data-delta|before-birth"):
+    with pytest.raises(ConformanceError, match="empty signed data"):
         checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
+
+
+def test_signer_without_seed_data_fails_all_structural_profile(
+    kernel_profile: KernelProfile,
+) -> None:
+    app = build_fake_app("disabled", None)
+    schema = cast("Any", app).openapi()
+    for path_item in schema["paths"].values():
+        operation = path_item.get("get")
+        if isinstance(operation, dict) and operation.get("operationId") == "surface_record":
+            operation["tags"] = []
+    cast("Any", app).openapi = lambda: schema
+
+    def signer_only(app: object, client: object) -> dict[str, str]:
+        cast("Any", app).state.source_signer = FakeRuntimeSigner()
+        return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
+
+    profile = _profile(
+        kernel_profile,
+        temporal_probes=tuple(
+            dataclasses.replace(
+                probe,
+                proof_mode=TemporalProofMode.STRUCTURAL,
+                later_sentinel=None,
+            )
+            for probe in kernel_profile.temporal_probes[:2]
+        ),
+        prepare_temporal_app=signer_only,
+    )
+    with pytest.raises(ConformanceError, match="empty signed data"):
+        checks.check_temporal_surface_behavior(profile, app)
 
 
 def test_unsigned_temporal_artifact_fails(kernel_profile: KernelProfile) -> None:

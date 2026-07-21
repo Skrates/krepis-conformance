@@ -733,6 +733,18 @@ def _is_source_surface_v1_media_type(content_type: str) -> bool:
     return versions == ["1"]
 
 
+def _is_semantically_empty_signed_data(value: Any) -> bool:
+    """Reject empty payloads even when a view model wraps them in containers."""
+
+    if value is None or value == "":
+        return True
+    if isinstance(value, Mapping):
+        return not value or all(_is_semantically_empty_signed_data(item) for item in value.values())
+    if isinstance(value, list):
+        return not value or all(_is_semantically_empty_signed_data(item) for item in value)
+    return False
+
+
 def _signed_surface(response: Any, *, operation_id: str, selected_date: str) -> _SignedSurface:
     if response.status_code != 200:
         if response.status_code == 503:
@@ -758,7 +770,7 @@ def _signed_surface(response: Any, *, operation_id: str, selected_date: str) -> 
         ) from error
     if not isinstance(body, dict):
         _fail(f"surface operation {operation_id!r} source artifact must be an object")
-    if "data" not in body or body["data"] in (None, {}, [], ""):
+    if "data" not in body or _is_semantically_empty_signed_data(body["data"]):
         _fail(
             f"surface operation {operation_id!r} returned empty signed data; the preparation "
             "hook must seed a real scenario"
