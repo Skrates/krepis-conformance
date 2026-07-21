@@ -13,6 +13,7 @@ import json
 import sys
 import types
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -24,7 +25,7 @@ from fastapi_mcp import FastApiMCP
 from fastapi_mcp.types import AuthConfig
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from krepis_conformance import KernelProfile
+from krepis_conformance import KernelProfile, TemporalProbe, TemporalProofMode
 
 FAKE_KERNEL_NAME = "taxis"  # borrowed registry identity; port 8205
 FAKE_SURFACES_MODULE = "krepis_fake_kernel_surfaces"
@@ -196,6 +197,11 @@ def build_fake_app(auth_mode: str, api_token: str | None) -> FastAPI:
     return app
 
 
+def prepare_fake_temporal_app(app: object, client: object) -> dict[str, str]:
+    """Return deterministic identifiers; behavioral seeding is added with the temporal check."""
+    return {"org_id": "org-temporal", "record_id": "record-later"}
+
+
 # ── the fake repo tree (Taxis template shape) ──────────────────────────
 
 
@@ -268,4 +274,27 @@ def kernel_profile(fake_kernel: FakeKernel) -> KernelProfile:
         build_app=build_fake_app,
         store_protocol=FakeEventStore,
         surfaces_module=FAKE_SURFACES_MODULE,
+        temporal_probes=(
+            TemporalProbe(
+                operation_id="surface_orgs",
+                earlier_as_of=date(2026, 1, 15),
+                later_as_of=date(2026, 2, 15),
+                proof_mode=TemporalProofMode.STRUCTURAL,
+            ),
+            TemporalProbe(
+                operation_id="surface_events",
+                earlier_as_of=date(2026, 1, 15),
+                later_as_of=date(2026, 2, 15),
+                proof_mode=TemporalProofMode.DATA_DELTA,
+                later_sentinel="LATER-EFFECTIVE-SENTINEL",
+                query_params=(("after_sequence", "0"),),
+            ),
+            TemporalProbe(
+                operation_id="surface_record",
+                earlier_as_of=date(2026, 1, 15),
+                later_as_of=date(2026, 2, 15),
+                proof_mode=TemporalProofMode.BEFORE_BIRTH,
+            ),
+        ),
+        prepare_temporal_app=prepare_fake_temporal_app,
     )

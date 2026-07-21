@@ -12,7 +12,15 @@ the consuming kernel.
 from __future__ import annotations
 
 from krepis_conformance.checks import ConformanceError
-from krepis_conformance.profile import AppBuilder, ConformanceItem, Deviation, KernelProfile
+from krepis_conformance.profile import (
+    AppBuilder,
+    ConformanceItem,
+    Deviation,
+    KernelProfile,
+    TemporalAppPreparer,
+    TemporalProbe,
+    TemporalProofMode,
+)
 from krepis_conformance.registry import (
     CONFORMANCE_BEARER_TOKEN,
     FAMILY_AUTH_DEFAULT,
@@ -38,4 +46,7 @@ __all__ = [
     "ConformanceItem",
     "Deviation",
     "KernelProfile",
+    "TemporalAppPreparer",
+    "TemporalProbe",
+    "TemporalProofMode",
 ]
