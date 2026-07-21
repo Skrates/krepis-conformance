@@ -11,7 +11,7 @@ dependencies: the package depends only on `pytest`, `httpx`, and `pyyaml`.
 from the consuming kernel's own environment, so this package can never drag a
 version pin into a kernel.
 
-## What the suite asserts (KRA-752 standard §1–§9, + §11)
+## What the suite asserts
 
 | § | Check | Mechanism |
 |---|-------|-----------|
@@ -25,6 +25,7 @@ version pin into a kernel.
 | 8 | `deploy/coolify.yml` pins an immutable digest (literal `@sha256` or required `${VAR:?…digest…}`), never `:latest`; `compose.yml` declares a healthcheck; the kernel binds its registry port and nobody else's | YAML parsing |
 | 9 | `integrations/sokrates` bundle completeness: `*source.yaml` + `specs/*.openapi.json` + `recipes/` + `compose.*.yml` + `README.md` (the Taxis template) | tree checks |
 | 11 | governed-read selector convention (KRA-780): any privileged-read-shaped query param (pii/unmask/reveal/plaintext/decrypt/sensitive) is spelled exactly `include_pii` — the one name the public Morphe viewer strips fail-closed at its forwarding choke point (morphe #59), so a future source cannot silently opt out of the edge guard | live OpenAPI query-param scan |
+| Temporal | operation-complete effective date (KRA-779): every GET tagged `surfaces` declares exactly one optional `as_of` query parameter with a string/date schema; retired names are forbidden while sequence/cursor axes remain independent; every operation proves real signed behavior at two dates | live OpenAPI equality + fresh memory app + TestClient |
 
 Port registry (§8): zygos 8200 · Obolos 8201 · Apotheke 8202 · chreos 8203 ·
 Misthos 8204 · Taxis 8205. Adding a kernel or moving a port is a family
@@ -39,20 +40,23 @@ turns every kernel's CI red until it follows.
    ```toml
    [dependency-groups]
    dev = [
-       "krepis-conformance @ git+https://github.com/RationallyPrime/krepis-conformance.git@v0.1.0",
+       "krepis-conformance @ git+https://github.com/RationallyPrime/krepis-conformance.git@v0.4.0",
    ]
    ```
 
 2. Declare the profile in `tests/conftest.py`:
 
    ```python
-   import pytest
    from pathlib import Path
+
+   import pytest
+
    from krepis_conformance import KernelProfile
 
    from taxis.api.app import create_app
    from taxis.settings import Settings
    from taxis.storage.repository import EventStore
+   from tests.temporal_conformance import TEMPORAL_PROBES, prepare_temporal_app
 
 
    @pytest.fixture
@@ -73,6 +77,8 @@ turns every kernel's CI red until it follows.
            build_app=build_app,
            store_protocol=EventStore,
            surfaces_module="taxis.surfaces",
+           temporal_probes=TEMPORAL_PROBES,
+           prepare_temporal_app=prepare_temporal_app,
        )
    ```
 
@@ -95,10 +101,43 @@ suite alongside the kernel's own tests.
 | `build_app` | `(auth_mode, api_token) -> app` — fresh, **memory-backed**, MCP handle on `app.state.mcp` |
 | `store_protocol` | the `EventStore` `Protocol` class (§6) |
 | `surfaces_module` | dotted module exporting `EXPECTED_GRAMMAR_VERSION` (§4) |
+| `temporal_probes` | **required tuple** with exactly one `TemporalProbe` per live `surfaces` GET `operationId`; its set must match OpenAPI exactly |
+| `prepare_temporal_app` | **required callback** `(app, TestClient) -> Mapping[str, str]`; installs a runtime test signer, seeds through real append endpoints, and returns values for generated OpenAPI path parameters |
 | `protected_probe_path` | a real authenticated GET route (default `/orgs`) for the §7 behavioural probe |
 | `deviations` | declared, reasoned departures — see below |
 
-### Deviations — the only escape hatch
+### Temporal probes (required since v0.4.0)
+
+The profile contract is intentionally backwards-incompatible. An omitted or
+empty temporal probe tuple fails construction, and the temporal section has no
+deviation enum. Adding or removing a `surfaces` GET therefore turns CI red
+until its operation-id case is added or removed in the same change.
+
+The harness discovers each path from live OpenAPI, adds `as_of` itself, and
+performs real source-v1 requests inside a fresh memory-backed app. The prepare
+callback may install the kernel's runtime-only test signer and must seed a
+non-empty scenario through append endpoints where the kernel exposes them. Its
+returned mapping is used only to fill generated path identifiers such as
+`org_id` or `book_id`; it cannot resolve, snap, or reinterpret dates.
+
+Each probe selects exactly one proof mode:
+
+- `DATA_DELTA`: both dates return 200; canonical signed artifact `data` changes,
+  and the named later-effective sentinel is absent then present.
+- `BEFORE_BIRTH`: the earlier date returns 404 and the later date returns a
+  signed 200 artifact.
+- `STRUCTURAL`: canonical signed `data` remains equal, but `surface_id` is
+  date-addressed and changes across the two requests. Structural surfaces are
+  therefore covered, not exempted.
+
+All signed 200 artifacts must carry a runtime signature, `source_revision`, and
+a `surface_id` containing the selected ISO date. Equality uses
+`morphe_surface.canonical_json_bytes(artifact.data)` only—never raw response
+bytes, signatures, or `produced_at` noise. Query params such as `at_sequence`,
+`as_of_sequence`, and `after_sequence` may be supplied independently through a
+probe's `query_params`; the harness owns `as_of`.
+
+### Deviations — the legacy-section escape hatch
 
 A kernel that genuinely cannot satisfy an item declares it **with a reason**;
 the suite then skips that item loudly (the reason shows in pytest output).
@@ -122,6 +161,9 @@ KernelProfile(
     ),
 )
 ```
+
+KRA-779 temporal conformance is deliberately not a `ConformanceItem`, so no
+deviation can skip it.
 
 ## Vendoring fallback
 

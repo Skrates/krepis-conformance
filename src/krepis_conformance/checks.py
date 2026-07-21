@@ -17,10 +17,15 @@ from __future__ import annotations
 import importlib
 import re
 import typing
+from collections.abc import Mapping
+from dataclasses import dataclass
+from email.message import Message
 from typing import TYPE_CHECKING, Any, NoReturn, cast
+from urllib.parse import quote
 
 import yaml
 
+from krepis_conformance.profile import TemporalProofMode
 from krepis_conformance.registry import (
     CONFORMANCE_BEARER_TOKEN,
     FAMILY_AUTH_DEFAULT,
@@ -31,6 +36,10 @@ from krepis_conformance.registry import (
     GOVERNED_READ_PARAM,
     MORPHE_REPO_PATTERN,
     ORG_SCOPE_PREFIX,
+    RETIRED_TEMPORAL_QUERY_PARAMS,
+    SOURCE_SURFACE_MEDIA_TYPE,
+    SURFACE_OPERATION_TAG,
+    TEMPORAL_QUERY_PARAM,
     UNAUTHORIZED_CODE,
     UNSCOPED_PATH_ALLOWLIST,
 )
@@ -38,7 +47,7 @@ from krepis_conformance.registry import (
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from krepis_conformance.profile import KernelProfile
+    from krepis_conformance.profile import KernelProfile, TemporalProbe
 
 
 class ConformanceError(AssertionError):
@@ -443,6 +452,455 @@ def check_governed_read_params(profile: KernelProfile, app: object) -> None:
         )
 
 
+# ── Temporal: operation-complete effective-date surfaces (KRA-779) ─────
+
+
+@dataclass(frozen=True, slots=True)
+class _SurfaceGetOperation:
+    path: str
+    parameters: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _SignedSurface:
+    data: Any
+    canonical_data: bytes
+    surface_id: str
+
+
+def _resolve_openapi_parameter(
+    schema: dict[str, Any], parameter: object, *, operation_id: str
+) -> dict[str, Any]:
+    if not isinstance(parameter, dict):
+        _fail(f"surface operation {operation_id!r} declares a non-object OpenAPI parameter")
+    reference = parameter.get("$ref")
+    if reference is None:
+        return cast("dict[str, Any]", parameter)
+    prefix = "#/components/parameters/"
+    if not isinstance(reference, str) or not reference.startswith(prefix):
+        _fail(
+            f"surface operation {operation_id!r} uses unsupported parameter reference "
+            f"{reference!r}; use a local #/components/parameters reference"
+        )
+    name = reference.removeprefix(prefix)
+    components = schema.get("components")
+    parameters = components.get("parameters") if isinstance(components, dict) else None
+    resolved = parameters.get(name) if isinstance(parameters, dict) else None
+    if not isinstance(resolved, dict):
+        _fail(f"surface operation {operation_id!r} has unresolved parameter ref {reference!r}")
+    return cast("dict[str, Any]", resolved)
+
+
+def _surface_get_operations(
+    profile: KernelProfile, app: object
+) -> tuple[dict[str, Any], dict[str, _SurfaceGetOperation]]:
+    openapi = getattr(app, "openapi", None)
+    if not callable(openapi):
+        _fail(f"{profile.kernel_name} app does not expose .openapi()")
+    schema = openapi()
+    if not isinstance(schema, dict):
+        _fail(f"{profile.kernel_name} app.openapi() must return an object")
+    paths = schema.get("paths")
+    if not isinstance(paths, dict):
+        _fail(f"{profile.kernel_name} OpenAPI document must contain a paths object")
+
+    operations: dict[str, _SurfaceGetOperation] = {}
+    for path, path_item in paths.items():
+        if not isinstance(path, str) or not isinstance(path_item, dict):
+            continue
+        operation = path_item.get("get")
+        if not isinstance(operation, dict):
+            continue
+        tags = operation.get("tags")
+        if not isinstance(tags, list) or SURFACE_OPERATION_TAG not in tags:
+            continue
+        operation_id = operation.get("operationId")
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            _fail(f"surfaces GET {path!r} must declare a non-empty operationId")
+        if operation_id in operations:
+            _fail(f"duplicate surfaces GET operationId {operation_id!r} in live OpenAPI")
+
+        effective_parameters: dict[tuple[str, str], dict[str, Any]] = {}
+        for owner, scope in ((path_item, "path-item"), (operation, "operation")):
+            declared = owner.get("parameters")
+            if declared is None:
+                continue
+            if not isinstance(declared, list):
+                _fail(f"surface operation {operation_id!r} parameters must be an array")
+            seen_in_scope: set[tuple[str, str]] = set()
+            for raw_parameter in declared:
+                parameter = _resolve_openapi_parameter(
+                    schema, raw_parameter, operation_id=operation_id
+                )
+                name = parameter.get("name")
+                location = parameter.get("in")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(location, str)
+                    or not location
+                ):
+                    _fail(
+                        f"surface operation {operation_id!r} declares a {scope} parameter "
+                        "without non-empty string `name` and `in` fields"
+                    )
+                identity = (name, location)
+                if identity in seen_in_scope:
+                    _fail(
+                        f"surface operation {operation_id!r} declares duplicate {scope} "
+                        f"parameter {identity!r}"
+                    )
+                seen_in_scope.add(identity)
+                # OpenAPI operation parameters override Path Item parameters
+                # with the same resolved (name, in) identity.
+                effective_parameters[identity] = parameter
+        parameters = tuple(effective_parameters.values())
+        operations[operation_id] = _SurfaceGetOperation(path=path, parameters=parameters)
+    return schema, operations
+
+
+def _is_string_date_schema(schema: object) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    if schema_type == "string" and schema.get("format") == "date":
+        return True
+    if (
+        isinstance(schema_type, list)
+        and set(schema_type) == {"string", "null"}
+        and schema.get("format") == "date"
+    ):
+        return True
+    variants = schema.get("anyOf", schema.get("oneOf"))
+    if not isinstance(variants, list):
+        return False
+    date_variants = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict)
+        and variant.get("type") == "string"
+        and variant.get("format") == "date"
+    ]
+    null_variants = [
+        variant
+        for variant in variants
+        if isinstance(variant, dict) and variant.get("type") == "null"
+    ]
+    return len(date_variants) == 1 and len(date_variants) + len(null_variants) == len(variants)
+
+
+def _validated_temporal_operations(
+    profile: KernelProfile, app: object
+) -> dict[str, _SurfaceGetOperation]:
+    _schema, operations = _surface_get_operations(profile, app)
+    for operation_id, operation in operations.items():
+        query_parameters = [
+            parameter for parameter in operation.parameters if parameter.get("in") == "query"
+        ]
+        retired = sorted(
+            {
+                str(parameter.get("name"))
+                for parameter in query_parameters
+                if isinstance(parameter.get("name"), str)
+                and parameter["name"].casefold() in RETIRED_TEMPORAL_QUERY_PARAMS
+            }
+        )
+        if retired:
+            _fail(
+                f"surface operation {operation_id!r} ({operation.path}) retains retired "
+                f"effective-time selector(s) {retired!r}; use exactly {TEMPORAL_QUERY_PARAM!r}. "
+                "Sequence axes at_sequence/as_of_sequence/after_sequence remain independent."
+            )
+        as_of_parameters = [
+            parameter
+            for parameter in query_parameters
+            if parameter.get("name") == TEMPORAL_QUERY_PARAM
+        ]
+        if len(as_of_parameters) != 1:
+            _fail(
+                f"surface operation {operation_id!r} ({operation.path}) must declare exactly one "
+                f"optional query parameter named {TEMPORAL_QUERY_PARAM!r}; found "
+                f"{len(as_of_parameters)}"
+            )
+        as_of = as_of_parameters[0]
+        if as_of.get("required", False) is not False:
+            _fail(
+                f"surface operation {operation_id!r} ({operation.path}) must make "
+                f"{TEMPORAL_QUERY_PARAM!r} optional"
+            )
+        if not _is_string_date_schema(as_of.get("schema")):
+            _fail(
+                f"surface operation {operation_id!r} ({operation.path}) must declare "
+                f"{TEMPORAL_QUERY_PARAM!r} as OpenAPI string/date; got {as_of.get('schema')!r}"
+            )
+
+    declared = {probe.operation_id for probe in profile.temporal_probes}
+    discovered = set(operations)
+    if declared != discovered:
+        missing_probes = sorted(discovered - declared)
+        unknown_probes = sorted(declared - discovered)
+        _fail(
+            "temporal probe operation-id set must equal the live OpenAPI surfaces GET set exactly; "
+            f"missing probes={missing_probes!r}, unknown probes={unknown_probes!r}"
+        )
+    return operations
+
+
+def check_temporal_surface_openapi(profile: KernelProfile, app: object) -> None:
+    """KRA-779: every ``surfaces`` GET exposes exactly one optional date ``as_of``.
+
+    This section is intentionally absent from :class:`ConformanceItem`: it is
+    operation-complete and non-deviatable. The live OpenAPI operation-id set
+    must equal the profile's required probe set, so a newly added pane cannot
+    silently miss either schema or behavioral coverage.
+    """
+    _validated_temporal_operations(profile, app)
+
+
+def _prepared_path_parameters(
+    profile: KernelProfile, app: object, client: Any
+) -> Mapping[str, str]:
+    try:
+        prepared = profile.prepare_temporal_app(app, client)
+    except Exception as error:
+        raise ConformanceError(
+            f"prepare_temporal_app failed while installing the runtime signer/seeding through "
+            f"append endpoints: {type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(prepared, Mapping):
+        _fail(
+            "prepare_temporal_app must return a mapping of OpenAPI path-parameter names to "
+            "seeded values"
+        )
+    if not prepared:
+        _fail(
+            "prepare_temporal_app returned an empty mapping; the required preparation/seed "
+            "hook may not be empty or a no-op"
+        )
+    for name, value in prepared.items():
+        if not isinstance(name, str) or not name or not isinstance(value, str) or not value:
+            _fail("prepare_temporal_app path parameters must be non-empty string pairs")
+    return prepared
+
+
+_PATH_PARAMETER_RE = re.compile(r"\{([^{}]+)\}")
+
+
+def _render_seeded_path(
+    operation_id: str, operation: _SurfaceGetOperation, path_parameters: Mapping[str, str]
+) -> str:
+    path = operation.path
+    required = _PATH_PARAMETER_RE.findall(path)
+    missing = sorted(name for name in required if name not in path_parameters)
+    if missing:
+        _fail(
+            f"prepare_temporal_app did not return seeded path parameter(s) {missing!r} "
+            f"required by surface operation {operation_id!r} ({path})"
+        )
+    for name in required:
+        path = path.replace("{" + name + "}", quote(path_parameters[name], safe=""))
+    return path
+
+
+def _canonical_signed_data(data: Any, *, operation_id: str) -> bytes:
+    morphe_surface = importlib.import_module("morphe_surface")
+    canonicalize = getattr(morphe_surface, "canonical_json_bytes", None)
+    if not callable(canonicalize):
+        _fail(
+            "morphe_surface must export canonical_json_bytes so temporal probes compare the "
+            "signed data contract, never raw response bytes"
+        )
+    try:
+        canonical = canonicalize(data)
+    except Exception as error:
+        raise ConformanceError(
+            f"surface operation {operation_id!r} returned data that cannot be canonicalized: "
+            f"{type(error).__name__}: {error}"
+        ) from error
+    if not isinstance(canonical, bytes):
+        _fail("morphe_surface.canonical_json_bytes must return bytes")
+    return canonical
+
+
+def _is_source_surface_v1_media_type(content_type: str) -> bool:
+    message = Message()
+    message["content-type"] = content_type
+    expected_base, _, _version = SOURCE_SURFACE_MEDIA_TYPE.partition(";")
+    if message.get_content_type().casefold() != expected_base.casefold():
+        return False
+    parameters = message.get_params(header="content-type", failobj=[], unquote=True)
+    versions = [value for name, value in parameters[1:] if name.casefold() == "v"]
+    return versions == ["1"]
+
+
+def _is_semantically_empty_signed_data(value: Any) -> bool:
+    """Reject empty payloads even when a view model wraps them in containers."""
+
+    if value is None or value == "":
+        return True
+    if isinstance(value, Mapping):
+        return not value or all(_is_semantically_empty_signed_data(item) for item in value.values())
+    if isinstance(value, list):
+        return not value or all(_is_semantically_empty_signed_data(item) for item in value)
+    return False
+
+
+def _signed_surface(response: Any, *, operation_id: str, selected_date: str) -> _SignedSurface:
+    if response.status_code != 200:
+        if response.status_code == 503:
+            _fail(
+                f"surface operation {operation_id!r} returned 503 for as_of={selected_date}; "
+                "prepare_temporal_app must install a runtime test signer on the fresh app"
+            )
+        _fail(
+            f"surface operation {operation_id!r} must return signed source-v1 200 for "
+            f"as_of={selected_date}; got {response.status_code}: {response.text[:240]!r}"
+        )
+    content_type = response.headers.get("content-type", "")
+    if not _is_source_surface_v1_media_type(content_type):
+        _fail(
+            f"surface operation {operation_id!r} returned {content_type!r}; temporal probes "
+            f"require signed source-v1 {SOURCE_SURFACE_MEDIA_TYPE!r}"
+        )
+    try:
+        body = response.json()
+    except ValueError as error:
+        raise ConformanceError(
+            f"surface operation {operation_id!r} did not return a JSON source artifact"
+        ) from error
+    if not isinstance(body, dict):
+        _fail(f"surface operation {operation_id!r} source artifact must be an object")
+    if "data" not in body or _is_semantically_empty_signed_data(body["data"]):
+        _fail(
+            f"surface operation {operation_id!r} returned empty signed data; the preparation "
+            "hook must seed a real scenario"
+        )
+    surface_id = body.get("surface_id")
+    if not isinstance(surface_id, str) or not surface_id:
+        _fail(f"surface operation {operation_id!r} source artifact has no surface_id")
+    if selected_date not in surface_id:
+        _fail(
+            f"surface operation {operation_id!r} must date-address signed identity for "
+            f"as_of={selected_date}; surface_id={surface_id!r}"
+        )
+    source_revision = body.get("source_revision")
+    if not isinstance(source_revision, str) or not source_revision:
+        _fail(f"surface operation {operation_id!r} source artifact has no source_revision")
+    attestation = body.get("attestation")
+    signature = attestation.get("signature") if isinstance(attestation, dict) else None
+    if not isinstance(signature, str) or not signature:
+        _fail(
+            f"surface operation {operation_id!r} source artifact is unsigned; "
+            "prepare_temporal_app must install a runtime test signer"
+        )
+    data = body["data"]
+    return _SignedSurface(
+        data=data,
+        canonical_data=_canonical_signed_data(data, operation_id=operation_id),
+        surface_id=surface_id,
+    )
+
+
+def _contains_named_sentinel(value: Any, sentinel: str) -> bool:
+    if isinstance(value, str):
+        return value == sentinel
+    if isinstance(value, list):
+        return any(_contains_named_sentinel(item, sentinel) for item in value)
+    if isinstance(value, dict):
+        return sentinel in value or any(
+            _contains_named_sentinel(item, sentinel) for item in value.values()
+        )
+    return False
+
+
+def _probe_temporal_operation(
+    probe: TemporalProbe,
+    operation: _SurfaceGetOperation,
+    client: Any,
+    path_parameters: Mapping[str, str],
+) -> None:
+    operation_id = probe.operation_id
+    path = _render_seeded_path(operation_id, operation, path_parameters)
+    earlier_date = probe.earlier_as_of.isoformat()
+    later_date = probe.later_as_of.isoformat()
+    base_params = list(probe.query_params)
+    headers = {"Accept": SOURCE_SURFACE_MEDIA_TYPE}
+    earlier = client.get(
+        path,
+        params=[*base_params, (TEMPORAL_QUERY_PARAM, earlier_date)],
+        headers=headers,
+    )
+    later = client.get(
+        path,
+        params=[*base_params, (TEMPORAL_QUERY_PARAM, later_date)],
+        headers=headers,
+    )
+
+    if probe.proof_mode is TemporalProofMode.BEFORE_BIRTH:
+        if earlier.status_code != 404:
+            _fail(
+                f"before-birth temporal probe {operation_id!r} must change 404→200; "
+                f"as_of={earlier_date} returned {earlier.status_code}"
+            )
+        _signed_surface(later, operation_id=operation_id, selected_date=later_date)
+        return
+
+    earlier_artifact = _signed_surface(
+        earlier, operation_id=operation_id, selected_date=earlier_date
+    )
+    later_artifact = _signed_surface(later, operation_id=operation_id, selected_date=later_date)
+    if earlier_artifact.surface_id == later_artifact.surface_id:
+        _fail(
+            f"surface operation {operation_id!r} reused signed surface_id "
+            f"{earlier_artifact.surface_id!r} across as_of={earlier_date} and {later_date}"
+        )
+
+    if probe.proof_mode is TemporalProofMode.STRUCTURAL:
+        if earlier_artifact.canonical_data != later_artifact.canonical_data:
+            _fail(
+                f"structural temporal probe {operation_id!r} must keep canonical signed data "
+                "equal while date-addressing identity"
+            )
+        return
+
+    if probe.proof_mode is TemporalProofMode.DATA_DELTA:
+        sentinel = cast("str", probe.later_sentinel)
+        if earlier_artifact.canonical_data == later_artifact.canonical_data:
+            _fail(
+                f"data-delta temporal probe {operation_id!r} returned equal canonical signed data"
+            )
+        if _contains_named_sentinel(earlier_artifact.data, sentinel):
+            _fail(
+                f"data-delta temporal probe {operation_id!r} exposes later-effective sentinel "
+                f"{sentinel!r} at earlier as_of={earlier_date}"
+            )
+        if not _contains_named_sentinel(later_artifact.data, sentinel):
+            _fail(
+                f"data-delta temporal probe {operation_id!r} does not expose named "
+                f"later-effective sentinel {sentinel!r} at as_of={later_date}"
+            )
+        return
+
+    _fail(f"surface operation {operation_id!r} has unsupported temporal proof mode")
+
+
+def check_temporal_surface_behavior(profile: KernelProfile, app: object) -> None:
+    """KRA-779: prove every surface through real signed HTTP requests at two dates.
+
+    Only canonical artifact ``data`` is compared. Signatures and ``produced_at``
+    are expected to vary and are never equality inputs. Each required probe
+    proves exactly one closed mode: data delta, before-birth, or structural.
+    """
+    operations = _validated_temporal_operations(profile, app)
+    testclient = importlib.import_module("starlette.testclient")
+    with testclient.TestClient(cast("Any", app), raise_server_exceptions=False) as client:
+        path_parameters = _prepared_path_parameters(profile, app, client)
+        for probe in profile.temporal_probes:
+            _probe_temporal_operation(
+                probe, operations[probe.operation_id], client, path_parameters
+            )
+
+
 __all__ = [
     "ConformanceError",
     "check_auth_errors",
@@ -459,4 +917,6 @@ __all__ = [
     "check_org_scope",
     "check_sokrates_bundle",
     "check_store_protocol",
+    "check_temporal_surface_behavior",
+    "check_temporal_surface_openapi",
 ]

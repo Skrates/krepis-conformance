@@ -11,7 +11,10 @@ from typing import Any, Literal, cast
 import pytest
 from conftest import (
     FAKE_GRAMMAR_VERSION,
+    FAKE_ORG_ID,
+    FAKE_RECORD_ID,
     FakeKernel,
+    FakeRuntimeSigner,
     build_fake_app,
     write_fake_repo_tree,
 )
@@ -21,7 +24,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.requests import Request
 
 from krepis_conformance import ConformanceError, KernelProfile, checks
-from krepis_conformance.profile import ConformanceItem, Deviation
+from krepis_conformance.profile import ConformanceItem, Deviation, TemporalProofMode
 
 
 def _mutated_tree(tmp_path: Path, mutate: dict[str, str]) -> Path:
@@ -349,10 +352,13 @@ def test_conforming_tree_passes_every_tree_check(
 # ── §11 governed-read selector convention ──────────────────────────────
 
 
-def _openapi_stub(paths: dict[str, Any]) -> object:
+def _openapi_stub(paths: dict[str, Any], *, components: dict[str, Any] | None = None) -> object:
     class _Stub:
         def openapi(self) -> dict[str, Any]:
-            return {"paths": paths}
+            schema = {"paths": paths}
+            if components is not None:
+                schema["components"] = components
+            return schema
 
     return _Stub()
 
@@ -416,6 +422,289 @@ def test_non_query_and_benign_params_pass(kernel_profile: KernelProfile) -> None
         }
     )
     checks.check_governed_read_params(kernel_profile, stub)
+
+
+# ── temporal as_of contract (non-deviatable) ───────────────────────────
+
+
+def _as_of_parameter(**overrides: Any) -> dict[str, Any]:
+    parameter: dict[str, Any] = {
+        "in": "query",
+        "name": "as_of",
+        "required": False,
+        "schema": {
+            "anyOf": [
+                {"type": "string", "format": "date"},
+                {"type": "null"},
+            ]
+        },
+    }
+    parameter.update(overrides)
+    return parameter
+
+
+def _temporal_openapi_stub(
+    parameters: list[dict[str, Any]],
+    *,
+    path_parameters: list[dict[str, Any]] | None = None,
+    components: dict[str, Any] | None = None,
+) -> object:
+    path_item: dict[str, Any] = {
+        "get": {
+            "tags": ["surfaces"],
+            "operationId": "surface_orgs",
+            "parameters": parameters,
+        }
+    }
+    if path_parameters is not None:
+        path_item["parameters"] = path_parameters
+    return _openapi_stub(
+        {"/surfaces/orgs": path_item},
+        components=components,
+    )
+
+
+def _one_probe_profile(kernel_profile: KernelProfile) -> KernelProfile:
+    return _profile(kernel_profile, temporal_probes=(kernel_profile.temporal_probes[0],))
+
+
+def test_temporal_openapi_and_probe_sets_match_exactly(kernel_profile: KernelProfile) -> None:
+    app = build_fake_app("disabled", None)
+    checks.check_temporal_surface_openapi(kernel_profile, app)
+
+    missing = _profile(kernel_profile, temporal_probes=kernel_profile.temporal_probes[:-1])
+    with pytest.raises(ConformanceError, match=r"missing probes=.*surface_record"):
+        checks.check_temporal_surface_openapi(missing, app)
+
+    unknown_case = dataclasses.replace(
+        kernel_profile.temporal_probes[0], operation_id="surface_retired"
+    )
+    unknown = _profile(
+        kernel_profile,
+        temporal_probes=(*kernel_profile.temporal_probes[1:], unknown_case),
+    )
+    with pytest.raises(ConformanceError, match=r"unknown probes=.*surface_retired"):
+        checks.check_temporal_surface_openapi(unknown, app)
+
+
+@pytest.mark.parametrize(
+    "retired",
+    ["week", "period", "effective_at", "window_start", "window_end", "from", "to"],
+)
+def test_every_retired_temporal_selector_fails(kernel_profile: KernelProfile, retired: str) -> None:
+    stub = _temporal_openapi_stub([_as_of_parameter(), {"in": "query", "name": retired}])
+    with pytest.raises(ConformanceError, match=retired):
+        checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_surface_get_requires_exactly_one_optional_string_date_as_of(
+    kernel_profile: KernelProfile,
+) -> None:
+    profile = _one_probe_profile(kernel_profile)
+    with pytest.raises(ConformanceError, match="exactly one"):
+        checks.check_temporal_surface_openapi(profile, _temporal_openapi_stub([]))
+    with pytest.raises(ConformanceError, match="duplicate operation parameter"):
+        checks.check_temporal_surface_openapi(
+            profile,
+            _temporal_openapi_stub([_as_of_parameter(), _as_of_parameter()]),
+        )
+    with pytest.raises(ConformanceError, match="optional"):
+        checks.check_temporal_surface_openapi(
+            profile,
+            _temporal_openapi_stub([_as_of_parameter(required=True)]),
+        )
+    with pytest.raises(ConformanceError, match="string/date"):
+        checks.check_temporal_surface_openapi(
+            profile,
+            _temporal_openapi_stub([_as_of_parameter(schema={"type": "string"})]),
+        )
+
+
+def test_operation_parameter_overrides_resolved_path_parameter(
+    kernel_profile: KernelProfile,
+) -> None:
+    components = {
+        "parameters": {
+            "RequiredPathAsOf": _as_of_parameter(required=True),
+            "OptionalOperationAsOf": _as_of_parameter(),
+        }
+    }
+    stub = _temporal_openapi_stub(
+        [{"$ref": "#/components/parameters/OptionalOperationAsOf"}],
+        path_parameters=[{"$ref": "#/components/parameters/RequiredPathAsOf"}],
+        components=components,
+    )
+
+    checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_invalid_operation_parameter_override_is_the_effective_parameter(
+    kernel_profile: KernelProfile,
+) -> None:
+    stub = _temporal_openapi_stub(
+        [_as_of_parameter(required=True)],
+        path_parameters=[_as_of_parameter()],
+    )
+
+    with pytest.raises(ConformanceError, match="optional"):
+        checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_duplicate_path_item_parameter_is_rejected(kernel_profile: KernelProfile) -> None:
+    stub = _temporal_openapi_stub(
+        [],
+        path_parameters=[_as_of_parameter(), _as_of_parameter()],
+    )
+
+    with pytest.raises(ConformanceError, match="duplicate path-item parameter"):
+        checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_sequence_and_cursor_axes_remain_independent(kernel_profile: KernelProfile) -> None:
+    parameters = [
+        _as_of_parameter(),
+        {"in": "query", "name": "at_sequence", "schema": {"type": "integer"}},
+        {"in": "query", "name": "as_of_sequence", "schema": {"type": "integer"}},
+        {"in": "query", "name": "after_sequence", "schema": {"type": "integer"}},
+    ]
+    checks.check_temporal_surface_openapi(
+        _one_probe_profile(kernel_profile), _temporal_openapi_stub(parameters)
+    )
+
+
+def test_temporal_behavior_exercises_all_three_proof_modes(
+    kernel_profile: KernelProfile,
+) -> None:
+    assert {probe.proof_mode for probe in kernel_profile.temporal_probes} == set(TemporalProofMode)
+    checks.check_temporal_surface_behavior(kernel_profile, build_fake_app("disabled", None))
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/vnd.morphe.source-surface+json;v=1",
+        'Application/Vnd.Morphe.Source-Surface+Json; charset=utf-8; V="1"',
+    ],
+)
+def test_source_v1_media_type_accepts_equivalent_forms(content_type: str) -> None:
+    assert checks._is_source_surface_v1_media_type(content_type)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/vnd.morphe.source-surface+json;v=10",
+        "application/vnd.morphe.source-surface+json",
+        "application/vnd.morphe.source-surface+json;v=2",
+        "application/json;v=1",
+        "application/vnd.morphe.source-surface+json;v=1;V=1",
+    ],
+)
+def test_source_v1_media_type_rejects_wrong_or_ambiguous_versions(content_type: str) -> None:
+    assert not checks._is_source_surface_v1_media_type(content_type)
+
+
+def test_noop_temporal_preparation_fails(kernel_profile: KernelProfile) -> None:
+    def noop(app: object, client: object) -> dict[str, str]:
+        return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
+
+    profile = _profile(kernel_profile, prepare_temporal_app=noop)
+    with pytest.raises(ConformanceError, match="runtime test signer"):
+        checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
+
+
+def test_empty_temporal_preparation_result_fails(kernel_profile: KernelProfile) -> None:
+    def empty(app: object, client: object) -> dict[str, str]:
+        return {}
+
+    profile = _profile(kernel_profile, prepare_temporal_app=empty)
+    with pytest.raises(ConformanceError, match="empty mapping"):
+        checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
+
+
+def test_signer_without_seed_data_fails(kernel_profile: KernelProfile) -> None:
+    def signer_only(app: object, client: object) -> dict[str, str]:
+        cast("Any", app).state.source_signer = FakeRuntimeSigner()
+        return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
+
+    profile = _profile(kernel_profile, prepare_temporal_app=signer_only)
+    with pytest.raises(ConformanceError, match="empty signed data"):
+        checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
+
+
+def test_signer_without_seed_data_fails_all_structural_profile(
+    kernel_profile: KernelProfile,
+) -> None:
+    app = build_fake_app("disabled", None)
+    schema = cast("Any", app).openapi()
+    for path_item in schema["paths"].values():
+        operation = path_item.get("get")
+        if isinstance(operation, dict) and operation.get("operationId") == "surface_record":
+            operation["tags"] = []
+    cast("Any", app).openapi = lambda: schema
+
+    def signer_only(app: object, client: object) -> dict[str, str]:
+        cast("Any", app).state.source_signer = FakeRuntimeSigner()
+        return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
+
+    profile = _profile(
+        kernel_profile,
+        temporal_probes=tuple(
+            dataclasses.replace(
+                probe,
+                proof_mode=TemporalProofMode.STRUCTURAL,
+                later_sentinel=None,
+            )
+            for probe in kernel_profile.temporal_probes[:2]
+        ),
+        prepare_temporal_app=signer_only,
+    )
+    with pytest.raises(ConformanceError, match="empty signed data"):
+        checks.check_temporal_surface_behavior(profile, app)
+
+
+def test_unsigned_temporal_artifact_fails(kernel_profile: KernelProfile) -> None:
+    class _UnsignedSigner:
+        def author(self, data: Any, *, surface_id: str) -> dict[str, Any]:
+            return {
+                "surface_id": surface_id,
+                "source_revision": "unsigned",
+                "data": data,
+                "attestation": {},
+            }
+
+    def unsigned(app: object, client: object) -> dict[str, str]:
+        cast("Any", app).state.source_signer = _UnsignedSigner()
+        response = cast("Any", client).post(
+            f"/orgs/{FAKE_ORG_ID}/appends",
+            json={
+                "events": [
+                    {
+                        "record_id": FAKE_RECORD_ID,
+                        "name": "LATER-EFFECTIVE-SENTINEL",
+                        "effective_date": "2026-02-01",
+                    }
+                ]
+            },
+        )
+        assert response.status_code == 201
+        return {"org_id": FAKE_ORG_ID, "record_id": FAKE_RECORD_ID}
+
+    profile = _profile(kernel_profile, prepare_temporal_app=unsigned)
+    with pytest.raises(ConformanceError, match=r"unsigned|runtime test signer"):
+        checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
+
+
+def test_data_delta_requires_its_named_sentinel(kernel_profile: KernelProfile) -> None:
+    probes = tuple(
+        dataclasses.replace(probe, later_sentinel="NEVER-SEE-THIS")
+        if probe.proof_mode is TemporalProofMode.DATA_DELTA
+        else probe
+        for probe in kernel_profile.temporal_probes
+    )
+    profile = _profile(kernel_profile, temporal_probes=probes)
+    with pytest.raises(ConformanceError, match="NEVER-SEE-THIS"):
+        checks.check_temporal_surface_behavior(profile, build_fake_app("disabled", None))
 
 
 # ── deviations skip loudly through the suite ───────────────────────────

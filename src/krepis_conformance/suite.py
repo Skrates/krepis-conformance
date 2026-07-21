@@ -11,6 +11,7 @@ Adoption in a kernel is two files:
     from taxis.api.app import create_app
     from taxis.settings import Settings
     from taxis.storage.repository import EventStore
+    from tests.temporal_conformance import TEMPORAL_PROBES, prepare_temporal_app
 
 
     @pytest.fixture
@@ -31,15 +32,18 @@ Adoption in a kernel is two files:
             build_app=build_app,
             store_protocol=EventStore,
             surfaces_module="taxis.surfaces",
+            temporal_probes=TEMPORAL_PROBES,
+            prepare_temporal_app=prepare_temporal_app,
         )
 
 ``tests/test_conformance.py``::
 
     from krepis_conformance.suite import *  # noqa: F401,F403
 
-Every test consults the profile's declared deviations first: a declared item
-skips with its reason in the pytest output (loud), an undeclared failure is
-red. There is no third state.
+The original KRA-752/KRA-780 tests consult the profile's declared deviations:
+a declared item skips with its reason in the pytest output (loud), an
+undeclared failure is red. The KRA-779 temporal section does not consult this
+escape hatch; its operation-complete ``as_of`` contract is non-deviatable.
 """
 
 from __future__ import annotations
@@ -72,6 +76,8 @@ __all__ = [
     "test_morphe_pin_is_the_family_tag",
     "test_parameterized_routes_are_org_scoped",
     "test_sokrates_bundle_is_complete",
+    "test_surface_as_of_behavior_is_operation_complete",
+    "test_surface_as_of_openapi_is_operation_complete",
 ]
 
 
@@ -199,3 +205,19 @@ def test_governed_read_selector_is_the_family_param(
 ) -> None:
     _respect_deviation(kernel_profile, ConformanceItem.GOVERNED_PARAMS)
     checks.check_governed_read_params(kernel_profile, conformance_app)
+
+
+# ── Temporal effective-date contract (KRA-779, non-deviatable) ─────────
+
+
+def test_surface_as_of_openapi_is_operation_complete(
+    kernel_profile: KernelProfile, conformance_app: object
+) -> None:
+    """Every surfaces GET has exactly one optional date ``as_of`` and one probe."""
+    checks.check_temporal_surface_openapi(kernel_profile, conformance_app)
+
+
+def test_surface_as_of_behavior_is_operation_complete(kernel_profile: KernelProfile) -> None:
+    """Every required case proves date semantics through a fresh signed memory app."""
+    temporal_app = kernel_profile.build_app("disabled", None)
+    checks.check_temporal_surface_behavior(kernel_profile, temporal_app)
