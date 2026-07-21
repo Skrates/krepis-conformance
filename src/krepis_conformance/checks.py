@@ -19,6 +19,7 @@ import re
 import typing
 from collections.abc import Mapping
 from dataclasses import dataclass
+from email.message import Message
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import quote
 
@@ -519,18 +520,41 @@ def _surface_get_operations(
         if operation_id in operations:
             _fail(f"duplicate surfaces GET operationId {operation_id!r} in live OpenAPI")
 
-        raw_parameters: list[object] = []
-        for owner in (path_item, operation):
+        effective_parameters: dict[tuple[str, str], dict[str, Any]] = {}
+        for owner, scope in ((path_item, "path-item"), (operation, "operation")):
             declared = owner.get("parameters")
             if declared is None:
                 continue
             if not isinstance(declared, list):
                 _fail(f"surface operation {operation_id!r} parameters must be an array")
-            raw_parameters.extend(declared)
-        parameters = tuple(
-            _resolve_openapi_parameter(schema, parameter, operation_id=operation_id)
-            for parameter in raw_parameters
-        )
+            seen_in_scope: set[tuple[str, str]] = set()
+            for raw_parameter in declared:
+                parameter = _resolve_openapi_parameter(
+                    schema, raw_parameter, operation_id=operation_id
+                )
+                name = parameter.get("name")
+                location = parameter.get("in")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or not isinstance(location, str)
+                    or not location
+                ):
+                    _fail(
+                        f"surface operation {operation_id!r} declares a {scope} parameter "
+                        "without non-empty string `name` and `in` fields"
+                    )
+                identity = (name, location)
+                if identity in seen_in_scope:
+                    _fail(
+                        f"surface operation {operation_id!r} declares duplicate {scope} "
+                        f"parameter {identity!r}"
+                    )
+                seen_in_scope.add(identity)
+                # OpenAPI operation parameters override Path Item parameters
+                # with the same resolved (name, in) identity.
+                effective_parameters[identity] = parameter
+        parameters = tuple(effective_parameters.values())
         operations[operation_id] = _SurfaceGetOperation(path=path, parameters=parameters)
     return schema, operations
 
@@ -698,6 +722,17 @@ def _canonical_signed_data(data: Any, *, operation_id: str) -> bytes:
     return canonical
 
 
+def _is_source_surface_v1_media_type(content_type: str) -> bool:
+    message = Message()
+    message["content-type"] = content_type
+    expected_base, _, _version = SOURCE_SURFACE_MEDIA_TYPE.partition(";")
+    if message.get_content_type().casefold() != expected_base.casefold():
+        return False
+    parameters = message.get_params(header="content-type", failobj=[], unquote=True)
+    versions = [value for name, value in parameters[1:] if name.casefold() == "v"]
+    return versions == ["1"]
+
+
 def _signed_surface(response: Any, *, operation_id: str, selected_date: str) -> _SignedSurface:
     if response.status_code != 200:
         if response.status_code == 503:
@@ -710,7 +745,7 @@ def _signed_surface(response: Any, *, operation_id: str, selected_date: str) -> 
             f"as_of={selected_date}; got {response.status_code}: {response.text[:240]!r}"
         )
     content_type = response.headers.get("content-type", "")
-    if not content_type.startswith(SOURCE_SURFACE_MEDIA_TYPE):
+    if not _is_source_surface_v1_media_type(content_type):
         _fail(
             f"surface operation {operation_id!r} returned {content_type!r}; temporal probes "
             f"require signed source-v1 {SOURCE_SURFACE_MEDIA_TYPE!r}"

@@ -352,10 +352,13 @@ def test_conforming_tree_passes_every_tree_check(
 # ── §11 governed-read selector convention ──────────────────────────────
 
 
-def _openapi_stub(paths: dict[str, Any]) -> object:
+def _openapi_stub(paths: dict[str, Any], *, components: dict[str, Any] | None = None) -> object:
     class _Stub:
         def openapi(self) -> dict[str, Any]:
-            return {"paths": paths}
+            schema = {"paths": paths}
+            if components is not None:
+                schema["components"] = components
+            return schema
 
     return _Stub()
 
@@ -440,17 +443,24 @@ def _as_of_parameter(**overrides: Any) -> dict[str, Any]:
     return parameter
 
 
-def _temporal_openapi_stub(parameters: list[dict[str, Any]]) -> object:
-    return _openapi_stub(
-        {
-            "/surfaces/orgs": {
-                "get": {
-                    "tags": ["surfaces"],
-                    "operationId": "surface_orgs",
-                    "parameters": parameters,
-                }
-            }
+def _temporal_openapi_stub(
+    parameters: list[dict[str, Any]],
+    *,
+    path_parameters: list[dict[str, Any]] | None = None,
+    components: dict[str, Any] | None = None,
+) -> object:
+    path_item: dict[str, Any] = {
+        "get": {
+            "tags": ["surfaces"],
+            "operationId": "surface_orgs",
+            "parameters": parameters,
         }
+    }
+    if path_parameters is not None:
+        path_item["parameters"] = path_parameters
+    return _openapi_stub(
+        {"/surfaces/orgs": path_item},
+        components=components,
     )
 
 
@@ -493,7 +503,7 @@ def test_surface_get_requires_exactly_one_optional_string_date_as_of(
     profile = _one_probe_profile(kernel_profile)
     with pytest.raises(ConformanceError, match="exactly one"):
         checks.check_temporal_surface_openapi(profile, _temporal_openapi_stub([]))
-    with pytest.raises(ConformanceError, match="exactly one"):
+    with pytest.raises(ConformanceError, match="duplicate operation parameter"):
         checks.check_temporal_surface_openapi(
             profile,
             _temporal_openapi_stub([_as_of_parameter(), _as_of_parameter()]),
@@ -508,6 +518,46 @@ def test_surface_get_requires_exactly_one_optional_string_date_as_of(
             profile,
             _temporal_openapi_stub([_as_of_parameter(schema={"type": "string"})]),
         )
+
+
+def test_operation_parameter_overrides_resolved_path_parameter(
+    kernel_profile: KernelProfile,
+) -> None:
+    components = {
+        "parameters": {
+            "RequiredPathAsOf": _as_of_parameter(required=True),
+            "OptionalOperationAsOf": _as_of_parameter(),
+        }
+    }
+    stub = _temporal_openapi_stub(
+        [{"$ref": "#/components/parameters/OptionalOperationAsOf"}],
+        path_parameters=[{"$ref": "#/components/parameters/RequiredPathAsOf"}],
+        components=components,
+    )
+
+    checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_invalid_operation_parameter_override_is_the_effective_parameter(
+    kernel_profile: KernelProfile,
+) -> None:
+    stub = _temporal_openapi_stub(
+        [_as_of_parameter(required=True)],
+        path_parameters=[_as_of_parameter()],
+    )
+
+    with pytest.raises(ConformanceError, match="optional"):
+        checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
+
+
+def test_duplicate_path_item_parameter_is_rejected(kernel_profile: KernelProfile) -> None:
+    stub = _temporal_openapi_stub(
+        [],
+        path_parameters=[_as_of_parameter(), _as_of_parameter()],
+    )
+
+    with pytest.raises(ConformanceError, match="duplicate path-item parameter"):
+        checks.check_temporal_surface_openapi(_one_probe_profile(kernel_profile), stub)
 
 
 def test_sequence_and_cursor_axes_remain_independent(kernel_profile: KernelProfile) -> None:
@@ -527,6 +577,31 @@ def test_temporal_behavior_exercises_all_three_proof_modes(
 ) -> None:
     assert {probe.proof_mode for probe in kernel_profile.temporal_probes} == set(TemporalProofMode)
     checks.check_temporal_surface_behavior(kernel_profile, build_fake_app("disabled", None))
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/vnd.morphe.source-surface+json;v=1",
+        'Application/Vnd.Morphe.Source-Surface+Json; charset=utf-8; V="1"',
+    ],
+)
+def test_source_v1_media_type_accepts_equivalent_forms(content_type: str) -> None:
+    assert checks._is_source_surface_v1_media_type(content_type)
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    [
+        "application/vnd.morphe.source-surface+json;v=10",
+        "application/vnd.morphe.source-surface+json",
+        "application/vnd.morphe.source-surface+json;v=2",
+        "application/json;v=1",
+        "application/vnd.morphe.source-surface+json;v=1;V=1",
+    ],
+)
+def test_source_v1_media_type_rejects_wrong_or_ambiguous_versions(content_type: str) -> None:
+    assert not checks._is_source_surface_v1_media_type(content_type)
 
 
 def test_noop_temporal_preparation_fails(kernel_profile: KernelProfile) -> None:

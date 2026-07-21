@@ -65,8 +65,8 @@ class TemporalProbe:
     def __post_init__(self) -> None:
         if not self.operation_id.strip():
             raise ValueError("temporal probe operation_id must be non-empty")
-        if not isinstance(self.earlier_as_of, date) or not isinstance(self.later_as_of, date):
-            raise TypeError("temporal probe dates must be datetime.date values")
+        if type(self.earlier_as_of) is not date or type(self.later_as_of) is not date:
+            raise TypeError("temporal probe dates must be date-only datetime.date values")
         if self.earlier_as_of >= self.later_as_of:
             raise ValueError("temporal probe earlier_as_of must precede later_as_of")
         if not isinstance(self.proof_mode, TemporalProofMode):

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -114,6 +114,23 @@ def test_temporal_probe_owns_as_of_and_orders_dates() -> None:
             operation_id="surface_rows",
             earlier_as_of=date(2026, 2, 1),
             later_as_of=date(2026, 2, 1),
+            proof_mode=TemporalProofMode.STRUCTURAL,
+        )
+
+
+@pytest.mark.parametrize(
+    ("earlier", "later"),
+    [
+        (datetime(2026, 1, 1, 12), date(2026, 2, 1)),
+        (date(2026, 1, 1), datetime(2026, 2, 1, 12)),
+    ],
+)
+def test_temporal_probe_rejects_datetime_values(earlier: date, later: date) -> None:
+    with pytest.raises(TypeError, match="date-only"):
+        TemporalProbe(
+            operation_id="surface_rows",
+            earlier_as_of=earlier,
+            later_as_of=later,
             proof_mode=TemporalProofMode.STRUCTURAL,
         )
 
